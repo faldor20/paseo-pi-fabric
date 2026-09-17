@@ -16,14 +16,19 @@ subagents, and exposes fabric actor log/message actions.
   truncated result preview. Unrecognized payloads keep the original tool row.
 - Server `agent.turn_ended` sync: terminal fabric children become labeled
   (`pi-fabric.mirror=true`) managed subagents of the Pi parent — visible in
-  the subagents track, archived with the parent, detachable. Mirrors are idle
+  the subagents track, archived with the parent, detachable. Only top-level
+  Pi parents sync, so mirrors never sprout their own mirrors. Mirrors are idle
   records carrying the reported outcome; they never re-run child work.
-  Dedupe is label-based (`pi-fabric.call-id`) since the 0.8.0 create call has
-  no idempotency key.
+  Dedupe is label-based (`pi-fabric.call-id` + `pi-fabric.child-index`)
+  since the 0.8.0 create call has no idempotency key; a failed agent list
+  defers the sync instead of duplicating. At most 10 mirrors per sync
+  (overflow defers to a later sync). Card status maps `stopped`→canceled and
+  `timed_out`→failed; the verbatim fabric status is kept in the row's
+  `originalStatus`.
 - Actor RPCs + agent panel + `/fabric-actors` slash command: list actors
-  (timeline + mesh sources), read actor logs, relay a message via the parent
-  agent. Direct mesh-mailbox writes are deliberately out of scope: the fabric
-  runtime owns that lock.
+  (timeline, up to 10 pages back, plus mesh sources), read actor logs, relay
+  a message via the parent agent. Direct mesh-mailbox writes are deliberately
+  out of scope: the fabric runtime owns that lock.
 
 ## Install
 

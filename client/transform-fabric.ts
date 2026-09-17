@@ -18,12 +18,11 @@ export const transformFabricExec: FabricTransformer = ({ item }) => {
   // Without program source there is nothing to summarize; keep the row.
   if (program === null) return;
 
-  const { codePreview, lineCount, nestedCalls } = summarizeFabricCode(program.code);
+  const { codePreview, lineCount, nestedCalls: codeNestedCalls } = summarizeFabricCode(program.code);
   const data: FabricExecData = {
     codePreview,
     lineCount,
-    ...(program.kernel ? { kernel: program.kernel } : {}),
-    nestedCalls,
+    nestedCalls: codeNestedCalls,
     agents: [],
     actors: [],
     resultTruncated: false,
@@ -39,6 +38,14 @@ export const transformFabricExec: FabricTransformer = ({ item }) => {
 
   if (item.status !== "running") {
     const summary = summarizeFabricResult(item.detail.output);
+    // Trace operations beat the code-regex counts when the envelope has them;
+    // the regex stays as the fallback for unfamiliar envelopes.
+    if (summary.operations.length > 0) data.nestedCalls = summary.operations;
+    if (summary.kernel !== undefined) {
+      data.kernel = summary.kernel;
+    } else if (program.kernel) {
+      data.kernel = program.kernel;
+    }
     data.agents = summary.agents;
     data.actors = summary.actors;
     if (summary.resultPreview !== undefined) {

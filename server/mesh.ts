@@ -12,7 +12,7 @@ export interface MeshActorEntry {
   detail?: string;
 }
 
-function findMeshRoot(cwd: string): string | null {
+export function findMeshRoot(cwd: string): string | null {
   let dir = cwd;
   for (let depth = 0; depth < 6; depth += 1) {
     const candidate = join(dir, ".pi", "fabric", "mesh");
@@ -40,29 +40,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 // Project-scope registry (`mesh/actors/`) plus session-scope registries
-// (`mesh/actors/<sessionId>/`). Entry filenames are not contracted, so every
-// JSON file directly under those directories is probed.
-export function listMeshActors(cwd: string): { root: string | null; actors: MeshActorEntry[] } {
-  const root = findMeshRoot(cwd);
-  if (!root) return { root, actors: [] };
-  const actorsDir = join(root, "actors");
-  const actors: MeshActorEntry[] = [];
+// (`mesh/actors/<sessionId>/`). Only that one level is read: deeper subtrees
+// (topics, shared state) are not actor records. Entry filenames are not
+// contracted, so every JSON file directly under those directories is probed,
+// but only single-actor definitions (`{ name, ... }`) are honored.
+function actorScopeDirs(actorsDir: string): string[] {
   let scopes: string[];
   try {
     scopes = readdirSync(actorsDir);
   } catch {
-    return { root, actors };
+    return [];
   }
-  const dirs = ["", ...scopes.filter((name) => {
-    try {
-      return statSync(join(actorsDir, name)).isDirectory();
-    } catch {
-      return false;
-    }
-  })];
-  for (const scope of dirs) {
-    const dir = scope === "" ? actorsDir : join(actorsDir, scope);
+  return [actorsDir, ...scopes.filter((name) => isDirectory(join(actorsDir, name)))];
+}
+
+export function listMeshActors(cwd: string): { root: string | null; actors: MeshActorEntry[] } {
+  const root = findMeshRoot(cwd);
+  if (!root) return { root, actors: [] };
+  const actors: MeshActorEntry[] = [];
+  for (const dir of actorScopeDirs(join(root, "actors"))) {
     let files: string[];
     try {
       files = readdirSync(dir);
@@ -72,19 +77,14 @@ export function listMeshActors(cwd: string): { root: string | null; actors: Mesh
     for (const file of files) {
       if (!file.endsWith(".json")) continue;
       const parsed = readJsonFile(join(dir, file));
-      if (!isRecord(parsed)) continue;
-      // Single-actor definition or a map of name -> definition.
-      const candidates = typeof parsed.name === "string" ? [parsed] : Object.values(parsed);
-      for (const candidate of candidates) {
-        if (!isRecord(candidate) || typeof candidate.name !== "string") continue;
-        actors.push({
-          name: candidate.name,
-          status: typeof candidate.status === "string" ? candidate.status : "unknown",
-          ...(typeof candidate.instructions === "string"
-            ? { detail: candidate.instructions.slice(0, 160) }
-            : {}),
-        });
-      }
+      if (!isRecord(parsed) || typeof parsed.name !== "string") continue;
+      actors.push({
+        name: parsed.name,
+        status: typeof parsed.status === "string" ? parsed.status : "unknown",
+        ...(typeof parsed.instructions === "string"
+          ? { detail: parsed.instructions.slice(0, 160) }
+          : {}),
+      });
     }
   }
   const seen = new Set<string>();
@@ -99,37 +99,22 @@ export function listMeshActors(cwd: string): { root: string | null; actors: Mesh
 }
 
 // Newest-first tail of an actor's mailbox/log. Fabric keeps the runner
-// transcript as `session.jsonl` next to the actor record; when the layout is
-// unrecognized an empty list is returned with the mesh root for debugging.
+// transcript as `session.jsonl` next to the actor record, so only those two
+// filenames directly under the actor scope directories are read — never a
+// recursive walk. Lines are matched by actor-name mention because record
+// shapes are still uncontracted (see `docs/fabric-wire.md`); when the layout
+// is unrecognized an empty list is returned with a note for debugging.
 export function readMeshActorLog(
   cwd: string,
   actorName: string,
   limit: number,
 ): { entries: string[]; note?: string; root: string | null } {
-  const { root } = listMeshActors(cwd);
+  const root = findMeshRoot(cwd);
   if (!root) return { entries: [], root, note: "No fabric mesh directory found above the agent cwd." };
   const hits: Array<{ mtime: number; line: string }> = [];
-  const walk = (dir: string, depth: number): void => {
-    if (depth > 4) return;
-    let entries: string[];
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      return;
-    }
-    for (const name of entries) {
+  for (const dir of actorScopeDirs(join(root, "actors"))) {
+    for (const name of ["session.jsonl", "mailbox.jsonl"]) {
       const path = join(dir, name);
-      let stat: ReturnType<typeof statSync>;
-      try {
-        stat = statSync(path);
-      } catch {
-        continue;
-      }
-      if (stat.isDirectory()) {
-        walk(path, depth + 1);
-        continue;
-      }
-      if (name !== "session.jsonl" && name !== "mailbox.jsonl") continue;
       let text: string;
       try {
         text = readFileSync(path, "utf8");
@@ -137,13 +122,18 @@ export function readMeshActorLog(
         continue;
       }
       if (!text.includes(actorName)) continue;
+      let mtime = 0;
+      try {
+        mtime = statSync(path).mtimeMs;
+      } catch {
+        continue;
+      }
       for (const line of text.split("\n").slice(-limit)) {
         const trimmed = line.trim();
-        if (trimmed) hits.push({ mtime: stat.mtimeMs, line: trimmed.slice(0, 500) });
+        if (trimmed) hits.push({ mtime, line: trimmed.slice(0, 500) });
       }
     }
-  };
-  walk(join(root, "actors"), 0);
+  }
   hits.sort((a, b) => a.mtime - b.mtime);
   const entries = hits.slice(-limit).map((hit) => hit.line);
   return {

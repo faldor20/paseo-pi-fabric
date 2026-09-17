@@ -2,11 +2,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { type PluginAgentPanelProps, useRpc } from "@getpaseo/plugin/client";
 import { useCallback, useMemo, useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
-import {
-  fabricActorLogRpc,
-  fabricActorTellRpc,
-  fabricActorsListRpc,
-} from "../shared/fabric";
+import { fabricActorLogRpc, fabricActorTellRpc, fabricActorsListRpc } from "../shared/fabric";
 
 function ActorRow({
   theme,
@@ -14,25 +10,15 @@ function ActorRow({
   name,
   status,
   detail,
-  callLog,
-  callTell,
-  logData,
-  logPending,
 }: {
   theme: PluginAgentPanelProps["theme"];
   agentId: string;
   name: string;
   status: string;
   detail?: string;
-  callLog: (input: { agentId: string; actorName: string }) => Promise<unknown>;
-  callTell: (input: {
-    parentAgentId: string;
-    actorName: string;
-    message: string;
-  }) => Promise<unknown>;
-  logData: { actorName: string; entries: string[]; note?: string } | undefined;
-  logPending: boolean;
 }) {
+  const readLog = useRpc(fabricActorLogRpc);
+  const tellActor = useRpc(fabricActorTellRpc);
   const [draft, setDraft] = useState("");
   const [sent, setSent] = useState<string | null>(null);
   const styles = useMemo(
@@ -57,19 +43,30 @@ function ActorRow({
       button: { padding: 10, borderRadius: 8, backgroundColor: theme.colors.accent },
       buttonText: { color: theme.colors.accentForeground, textAlign: "center" as const },
       log: { color: theme.colors.foregroundMuted },
+      error: { color: theme.colors.statusDanger },
     }),
     [theme],
   );
-  const showingLog = logData?.actorName === name;
+
+  const logMutation = useMutation({
+    mutationFn: () => readLog({ agentId, actorName: name }),
+  });
+  const tellMutation = useMutation({
+    mutationFn: (message: string) => tellActor({ parentAgentId: agentId, actorName: name, message }),
+    onSuccess: () => {
+      setSent("Relayed to Main for delivery.");
+      setDraft("");
+    },
+  });
 
   const handleTell = useCallback(() => {
     const message = draft.trim();
-    if (!message) return;
-    void callTell({ parentAgentId: agentId, actorName: name, message }).then(() => {
-      setSent("Relayed to Main for delivery.");
-      setDraft("");
-    });
-  }, [agentId, callTell, draft, name]);
+    if (!message || tellMutation.isPending) return;
+    tellMutation.mutate(message);
+  }, [draft, tellMutation]);
+
+  const showingLog = logMutation.data !== undefined && logMutation.data.actorName === name;
+  const logData = showingLog ? logMutation.data : undefined;
 
   return (
     <View style={styles.row}>
@@ -78,17 +75,18 @@ function ActorRow({
       <Pressable
         accessibilityRole="button"
         accessibilityLabel={`Show log for ${name}`}
-        onPress={() => void callLog({ agentId, actorName: name })}
+        onPress={() => logMutation.mutate()}
         style={styles.button}
       >
-        <Text style={styles.buttonText}>{logPending ? "Loading…" : "Show log"}</Text>
+        <Text style={styles.buttonText}>{logMutation.isPending ? "Loading…" : "Show log"}</Text>
       </Pressable>
-      {showingLog ? (
+      {logData ? (
         <Text style={styles.log}>
           {logData.entries.length > 0 ? logData.entries.join("\n") : "(no entries)"}
           {logData.note ? `\n${logData.note}` : ""}
         </Text>
       ) : null}
+      {logMutation.error ? <Text style={styles.error}>{logMutation.error.message}</Text> : null}
       <TextInput
         value={draft}
         onChangeText={setDraft}
@@ -102,17 +100,18 @@ function ActorRow({
         onPress={handleTell}
         style={styles.button}
       >
-        <Text style={styles.buttonText}>Send</Text>
+        <Text style={styles.buttonText}>
+          {tellMutation.isPending ? "Sending…" : "Send"}
+        </Text>
       </Pressable>
-      {sent ? <Text style={styles.meta}>{sent}</Text> : null}
+      {sent && !tellMutation.error ? <Text style={styles.meta}>{sent}</Text> : null}
+      {tellMutation.error ? <Text style={styles.error}>{tellMutation.error.message}</Text> : null}
     </View>
   );
 }
 
 export function FabricActorsPanel({ agentId, theme, layout }: PluginAgentPanelProps) {
   const listActors = useRpc(fabricActorsListRpc);
-  const readLog = useRpc(fabricActorLogRpc);
-  const tellActor = useRpc(fabricActorTellRpc);
   const styles = useMemo(
     () => ({
       screen: {
@@ -131,17 +130,6 @@ export function FabricActorsPanel({ agentId, theme, layout }: PluginAgentPanelPr
   const actorsQuery = useQuery({
     queryKey: ["fabric-actors", agentId],
     queryFn: () => listActors({ agentId }),
-  });
-  const [logData, setLogData] = useState<
-    { actorName: string; entries: string[]; note?: string } | undefined
-  >();
-  const logMutation = useMutation({
-    mutationFn: (input: { agentId: string; actorName: string }) => readLog(input),
-    onSuccess: (data) => setLogData(data),
-  });
-  const tellMutation = useMutation({
-    mutationFn: (input: { parentAgentId: string; actorName: string; message: string }) =>
-      tellActor(input),
   });
 
   return (
@@ -164,15 +152,8 @@ export function FabricActorsPanel({ agentId, theme, layout }: PluginAgentPanelPr
           name={actor.name}
           status={actor.status}
           detail={actor.detail}
-          callLog={(input) => logMutation.mutateAsync(input)}
-          callTell={(input) => tellMutation.mutateAsync(input)}
-          logData={logData}
-          logPending={logMutation.isPending}
         />
       ))}
-      {tellMutation.error ? (
-        <Text style={styles.error}>{tellMutation.error.message}</Text>
-      ) : null}
     </View>
   );
 }
