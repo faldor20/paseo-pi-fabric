@@ -1,0 +1,6 @@
+{
+  "id": "pi-fabric",
+  "requirements": {
+    "paseo": ">=0.8.0"
+  }
+}
