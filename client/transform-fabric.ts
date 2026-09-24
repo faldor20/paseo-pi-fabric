@@ -2,9 +2,11 @@ import type { PluginTimelineTransformerContribution } from "@getpaseo/plugin/cli
 import {
   FABRIC_TOOL_NAME,
   fabricExecDataSchema,
+  readFabricDisplay,
   readFabricExecInput,
   summarizeFabricCode,
   summarizeFabricResult,
+  titleHintForCode,
   type FabricExecData,
 } from "../shared/fabric";
 
@@ -19,6 +21,14 @@ export const transformFabricExec: FabricTransformer = ({ item }) => {
   if (program === null) return;
 
   const { codePreview, lineCount, nestedCalls: codeNestedCalls } = summarizeFabricCode(program.code);
+  // Collapsed header, Pi-compact style: the model's declared display name,
+  // else a code-derived intent hint ("Run + Read"), else the generic label.
+  const display = readFabricDisplay(
+    typeof item.detail.input === "object" && item.detail.input !== null
+      ? (item.detail.input as Record<string, unknown>).display
+      : undefined,
+  );
+  const titleHint = titleHintForCode(program.code);
   const data: FabricExecData = {
     codePreview,
     lineCount,
@@ -34,6 +44,10 @@ export const transformFabricExec: FabricTransformer = ({ item }) => {
           : item.status === "canceled"
             ? "canceled"
             : "completed",
+    ...(display.name ? { displayName: display.name } : {}),
+    ...(display.description ? { displayDescription: display.description } : {}),
+    ...(titleHint ? { titleHint } : {}),
+    calls: [],
   };
 
   if (item.status !== "running") {
@@ -48,6 +62,7 @@ export const transformFabricExec: FabricTransformer = ({ item }) => {
     }
     data.agents = summary.agents;
     data.actors = summary.actors;
+    data.calls = summary.calls;
     if (summary.resultPreview !== undefined) {
       data.resultPreview = summary.resultPreview;
     }

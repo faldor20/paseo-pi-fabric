@@ -21,6 +21,47 @@ export function readFabricExecInput(input: unknown): { code: string; kernel?: st
   };
 }
 
+// Pi-style `display` argument: the model may declare `{ name, description }`
+// or a bare string (repaired to `{ name }`). Mirrors Pi's
+// normalizeRunDisplay; unknown shapes yield no display.
+export function readFabricDisplay(input: unknown): { name?: string; description?: string } {
+  if (typeof input === "string") {
+    const name = input.trim();
+    if (!name) return {};
+    if (name.startsWith("{")) {
+      try {
+        const parsed: unknown = JSON.parse(name);
+        if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+          return readFabricDisplay(parsed);
+        }
+      } catch {
+        // Not a JSON object; fall through to the bare-string form.
+      }
+    }
+    return { name: input };
+  }
+  if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
+  const record = input as Record<string, unknown>;
+  return {
+    ...(typeof record.name === "string" && record.name.trim() ? { name: record.name } : {}),
+    ...(typeof record.description === "string" && record.description.trim()
+      ? { description: record.description }
+      : {}),
+  };
+}
+
+// One nested host call row, mirroring Pi's collapsed `› tool detail` lines.
+// The card shows the first 8 and hides the rest behind an expander; up to 30
+// are stored.
+export const fabricCallSchema = z.object({
+  ref: z.string(),
+  tool: z.string(),
+  detail: z.string().optional(),
+  success: z.boolean().optional(),
+});
+
+export type FabricCall = z.output<typeof fabricCallSchema>;
+
 // A nested host call referenced inside a fabric program, e.g. `pi.read` or
 // `agents.run`. Derived from program source, not from the result envelope,
 // so the card stays useful when the result shape is unfamiliar.
@@ -54,6 +95,10 @@ export const fabricAgentSchema = z.object({
   resultPreview: z.string().optional(),
   id: z.string().optional(),
   cwd: z.string().optional(),
+  // pi-fabric does not emit this yet (forward-compat): a stable per-child id
+  // for live-loop dedupe. Stripped from stored card rows; carried on the
+  // mirror candidate instead.
+  nestedToolCallId: z.string().optional(),
 });
 
 export type FabricAgent = z.output<typeof fabricAgentSchema>;
@@ -76,6 +121,13 @@ export const fabricExecDataSchema = z.object({
   resultPreview: z.string().optional(),
   resultTruncated: z.boolean(),
   status: z.enum(["running", "completed", "failed", "canceled"]),
+  // Pi-compact card fields, all additive so rows stored before them still
+  // parse: the model's declared `display` name/description, a code-derived
+  // title fallback, and one row per nested audit call.
+  displayName: z.string().optional(),
+  displayDescription: z.string().optional(),
+  titleHint: z.string().optional(),
+  calls: z.array(fabricCallSchema).default([]),
 });
 
 export type FabricExecData = z.output<typeof fabricExecDataSchema>;
@@ -115,6 +167,55 @@ function truncate(text: string, max: number): { preview: string; truncated: bool
   return { preview: `${text.slice(0, max)}…`, truncated: true };
 }
 
+// One-line collapse: Pi's truncateOneLine.
+function oneLine(value: string, max: number): string {
+  const single = value.replace(/\s+/g, " ").trim();
+  return single.length <= max ? single : `${single.slice(0, max - 1)}…`;
+}
+
+// Verb labels for the code-derived title hint. Pi derives these from a real
+// tokenizer (`fabricExecTitleHint`); this is a regex approximation over the
+// same dominant refs, so the collapsed card still reads as intent ("Run +
+// Read") instead of raw code.
+const TITLE_VERB_LABELS: Record<string, string> = {
+  run: "Run",
+  spawn: "Run",
+  read: "Read",
+  write: "Write",
+  edit: "Edit",
+  bash: "Shell",
+  powershell: "Shell",
+  grep: "Search",
+  find: "Search",
+  ls: "List",
+  ask: "Ask",
+  tell: "Tell",
+  wait: "Wait",
+  handoff: "Handoff",
+};
+
+const MAX_TITLE_HINT_CHARS = 64;
+
+function humanizeVerb(leaf: string): string {
+  return leaf.charAt(0).toUpperCase() + leaf.slice(1);
+}
+
+export function titleHintForCode(code: string): string | undefined {
+  const counts = new Map<string, number>();
+  for (const match of code.matchAll(HOST_CALL_PATTERN)) {
+    const leaf = match[2] ?? "";
+    const label = TITLE_VERB_LABELS[leaf] ?? humanizeVerb(leaf);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+  }
+  if (counts.size === 0) return undefined;
+  const segments = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, 2)
+    .map(([label, count]) => (count > 1 ? `${label} ×${count}` : label));
+  const hint = segments.join(" + ");
+  return hint.length <= MAX_TITLE_HINT_CHARS ? hint : `${hint.slice(0, MAX_TITLE_HINT_CHARS - 1)}…`;
+}
+
 function previewValue(value: unknown, max: number): { preview: string; truncated: boolean } {
   if (typeof value === "string") return truncate(value, max);
   try {
@@ -141,12 +242,22 @@ const fabricAuditSchema = z
     provider: z.string().optional(),
     args: z.unknown().optional(),
     result: z.unknown().optional(),
+    success: z.boolean().optional(),
+    preview: z.unknown().optional(),
+    // Planned by pi-fabric, not emitted yet: prefer it as the child key when
+    // present (see fabricChildKey).
+    nestedToolCallId: z.string().optional(),
   })
   .passthrough();
 
 const fabricDetailsSchema = z.object({ kernel: z.string().optional() }).passthrough();
 
 const fabricOutputSchema = z.object({ details: z.unknown().optional() }).passthrough();
+
+function readDetails(result: unknown): unknown {
+  const parsed = fabricOutputSchema.safeParse(result);
+  return parsed.success ? parsed.data.details : undefined;
+}
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -166,8 +277,40 @@ function countRefs(refs: string[]): FabricNestedCall[] {
     .slice(0, 24);
 }
 
+// Stable per-child key for mirror dedupe. pi-fabric plans to emit
+// `nestedToolCallId` on audits but does not yet, so the call-id + child-index
+// fallback must keep working; indices are stable because agent audits only
+// append within one fabric_exec call.
+export function fabricChildKey(
+  callId: string,
+  childIndex: number,
+  nestedToolCallId?: string,
+): string {
+  if (typeof nestedToolCallId === "string" && nestedToolCallId.length > 0) {
+    return `${callId}~${nestedToolCallId}`;
+  }
+  return `${callId}#${childIndex}`;
+}
+
+// Status for one `provider: "agents"` audit. Terminal audits keep the parsed
+// `result.status`; audits with no usable result status are in-flight when
+// `success` is still absent (running) and malformed otherwise (unknown).
+function auditAgentStatus(
+  success: boolean | undefined,
+  result: Record<string, unknown> | null,
+): FabricAgentStatus | null {
+  if (result !== null && typeof result.status === "string") {
+    const parsed = fabricAgentStatusSchema.safeParse(result.status);
+    if (parsed.success) return parsed.data;
+    if (success !== undefined) return "unknown";
+  }
+  return success === undefined ? "running" : "unknown";
+}
+
 // Audits-first extraction from the trace/audit envelope. Gotcha: real call
 // args live in `audits[].args` — `trace.operations[].args` is empty (`{}`).
+// In-flight children (live `fabric_exec` rows) appear here as audits with
+// args/startedAt but no `success`/`result` yet; they read as running.
 function readEnvelopeAudits(details: unknown): {
   agents: FabricAgent[];
   actors: FabricActor[];
@@ -182,22 +325,37 @@ function readEnvelopeAudits(details: unknown): {
     const audit = fabricAuditSchema.safeParse(raw);
     if (!audit.success) continue;
     const result = asRecord(audit.data.result);
-    if (audit.data.provider === "agents" && result !== null && typeof result.status === "string") {
-      const status = fabricAgentStatusSchema.safeParse(result.status);
+    // Only ephemeral spawns become subagent mirrors. Persistent-actor ops
+    // share provider "agents" (create -> FabricActorInfo, ask ->
+    // FabricActorMessage, tell -> { queued: true }) but message an existing
+    // actor by id; mirroring them shells a new orphan subagent per message.
+    if (audit.data.provider === "agents" && (audit.data.ref === "agents.run" || audit.data.ref === "agents.spawn")) {
+      const status = auditAgentStatus(audit.data.success, result);
+      if (status === null) continue;
       const args = asRecord(audit.data.args);
-      const text = typeof result.text === "string" ? truncate(result.text, MAX_AGENT_TEXT_PREVIEW_CHARS) : undefined;
+      const text =
+        result !== null && typeof result.text === "string"
+          ? truncate(result.text, MAX_AGENT_TEXT_PREVIEW_CHARS)
+          : undefined;
       if (textPreview === undefined && text !== undefined) textPreview = text;
       agents.push({
-        ...(typeof result.name === "string" ? { name: result.name } : {}),
-        status: status.success ? status.data : "unknown",
-        ...(typeof result.model === "string" ? { model: result.model } : {}),
-        ...(typeof result.runner === "string" ? { runner: result.runner } : {}),
+        ...(result !== null && typeof result.name === "string"
+          ? { name: result.name }
+          : args !== null && typeof args.name === "string"
+            ? { name: args.name }
+            : {}),
+        status,
+        ...(result !== null && typeof result.model === "string" ? { model: result.model } : {}),
+        ...(result !== null && typeof result.runner === "string" ? { runner: result.runner } : {}),
         ...(args !== null && typeof args.task === "string"
           ? { taskPreview: truncate(args.task, MAX_TASK_PREVIEW_CHARS).preview }
           : {}),
         ...(text !== undefined ? { resultPreview: text.preview } : {}),
-        ...(typeof result.id === "string" ? { id: result.id } : {}),
-        ...(typeof result.cwd === "string" ? { cwd: result.cwd } : {}),
+        ...(result !== null && typeof result.id === "string" ? { id: result.id } : {}),
+        ...(result !== null && typeof result.cwd === "string" ? { cwd: result.cwd } : {}),
+        ...(typeof audit.data.nestedToolCallId === "string" && audit.data.nestedToolCallId
+          ? { nestedToolCallId: audit.data.nestedToolCallId }
+          : {}),
       });
     } else if (audit.data.ref === "agents.create" && result !== null && typeof result.name === "string") {
       actors.push({
@@ -222,20 +380,158 @@ function readEnvelopeOperations(details: unknown): FabricNestedCall[] {
   return countRefs(refs);
 }
 
+const MAX_STORED_CALLS = 30;
+const MAX_TASK_DETAIL_CHARS = 64;
+const MAX_MESSAGE_DETAIL_CHARS = 48;
+
+function shortId(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value.slice(0, 8) : undefined;
+}
+
+function countValue(value: unknown): string {
+  if (Array.isArray(value)) return String(value.length);
+  if (typeof value === "object" && value !== null) return String(Object.keys(value).length);
+  return "";
+}
+
+function stringArg(args: Record<string, unknown>, key: string): string | undefined {
+  const value = args[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function agentPreviewName(raw: unknown): string | undefined {
+  const preview = asRecord(raw);
+  if (preview === null || typeof preview.kind !== "string") return undefined;
+  return typeof preview.name === "string" ? preview.name : undefined;
+}
+
+// Per-call detail text, ported from Pi's providerCallDetail plus the generic
+// command/path/task fallback in nestedCallTitleText. Powers the collapsed
+// `› tool detail` rows; empty detail renders as the bare tool name.
+function auditCallDetail(
+  provider: string,
+  tool: string,
+  args: Record<string, unknown>,
+  result: unknown,
+  preview: unknown,
+): string {
+  if (provider === "agents") {
+    const name = stringArg(args, "name");
+    const previewName = agentPreviewName(preview);
+    const id = shortId(args.id);
+    const message = stringArg(args, "message");
+    const task = stringArg(args, "task");
+    switch (tool) {
+      case "create":
+        return name ?? "";
+      case "run":
+      case "spawn":
+        return name ?? (task ? oneLine(task, MAX_TASK_DETAIL_CHARS) : (previewName ?? ""));
+      case "ask":
+      case "tell":
+        return [previewName ?? name ?? id, message ? oneLine(message, MAX_MESSAGE_DETAIL_CHARS) : ""]
+          .filter(Boolean)
+          .join(" ");
+      case "remove":
+      case "stop":
+      case "cleanup":
+      case "wait":
+      case "status":
+      case "actorStatus":
+      case "messages":
+        return previewName ?? name ?? id ?? "";
+      case "actors":
+      case "list":
+      case "models":
+      case "peers":
+        return countValue(result);
+      default:
+        return previewName ?? id ?? "";
+    }
+  }
+  if (provider === "mesh") {
+    switch (tool) {
+      case "publish":
+        return stringArg(args, "topic") ?? "";
+      case "read":
+        return [stringArg(args, "topic"), countValue(result)].filter(Boolean).join(" · ");
+      case "get":
+      case "put":
+      case "delete":
+        return stringArg(args, "key") ?? "";
+      case "list":
+        return [stringArg(args, "prefix"), countValue(result)].filter(Boolean).join(" · ");
+      case "members":
+        return countValue(result);
+      default:
+        return "";
+    }
+  }
+  if (provider === "mcp") {
+    switch (tool) {
+      case "$call":
+        return [stringArg(args, "server"), stringArg(args, "tool")].filter(Boolean).join(".");
+      case "$register":
+        return stringArg(args, "name") ?? "";
+      case "$servers":
+        return countValue(result);
+      default:
+        return "";
+    }
+  }
+  const command = stringArg(args, "command");
+  if (command) {
+    const firstLine = command.split("\n")[0] ?? "";
+    return firstLine ? `$ ${firstLine}` : "";
+  }
+  const path = stringArg(args, "path");
+  if (path) return path;
+  const pattern = stringArg(args, "pattern");
+  if (pattern) return path ? `/${pattern}/ ${path}` : `/${pattern}/`;
+  const task = stringArg(args, "task");
+  if (task) return oneLine(task, MAX_TASK_DETAIL_CHARS);
+  return "";
+}
+
+// One collapsed row per nested audit call, in envelope order. Mirrors the
+// rows Pi's compact result renderer builds from the same audits.
+export function extractFabricCalls(details: unknown): FabricCall[] {
+  const record = asRecord(details);
+  if (record === null || !Array.isArray(record.audits)) return [];
+  const calls: FabricCall[] = [];
+  for (const raw of record.audits.slice(0, MAX_STORED_CALLS)) {
+    const audit = fabricAuditSchema.safeParse(raw);
+    if (!audit.success) continue;
+    const ref = typeof audit.data.ref === "string" ? audit.data.ref : undefined;
+    if (!ref) continue;
+    const [provider = ref, tool = ref] = ref.split(".");
+    const args = asRecord(audit.data.args) ?? {};
+    const detail = auditCallDetail(provider, tool, args, audit.data.result, audit.data.preview);
+    calls.push({
+      ref,
+      tool,
+      ...(detail ? { detail } : {}),
+      ...(typeof audit.data.success === "boolean" ? { success: audit.data.success } : {}),
+    });
+  }
+  return calls;
+}
+
 export function extractFabricContent(output: unknown): {
   agents: FabricAgent[];
   actors: FabricActor[];
   operations: FabricNestedCall[];
+  calls: FabricCall[];
   kernel?: string;
   resultPreview?: string;
   resultTruncated: boolean;
 } {
-  const parsed = fabricOutputSchema.safeParse(output);
-  const details = parsed.success ? parsed.data.details : undefined;
+  const details = readDetails(output);
   const detailsParsed = fabricDetailsSchema.safeParse(details);
   const kernel = detailsParsed.success ? detailsParsed.data.kernel : undefined;
   const { agents, actors, textPreview } = readEnvelopeAudits(details);
   const operations = readEnvelopeOperations(details);
+  const calls = extractFabricCalls(details);
   if (textPreview !== undefined) {
     // Agent text beats a JSON dump of the whole envelope as the
     // card/mirror preview.
@@ -243,12 +539,13 @@ export function extractFabricContent(output: unknown): {
       agents,
       actors,
       operations,
+      calls,
       ...(kernel ? { kernel } : {}),
       resultPreview: textPreview.preview,
       resultTruncated: textPreview.truncated,
     };
   }
-  return { agents, actors, operations, ...(kernel ? { kernel } : {}), resultTruncated: false };
+  return { agents, actors, operations, calls, ...(kernel ? { kernel } : {}), resultTruncated: false };
 }
 
 // Defensive extraction of child-agent entries from legacy top-level `agents`
@@ -311,22 +608,25 @@ export function summarizeFabricResult(result: unknown): {
   agents: FabricAgent[];
   actors: FabricActor[];
   operations: FabricNestedCall[];
+  calls: FabricCall[];
   kernel?: string;
   resultPreview?: string;
   resultTruncated: boolean;
 } {
   if (result === null || result === undefined) {
-    return { agents: [], actors: [], operations: [], resultTruncated: false };
+    return { agents: [], actors: [], operations: [], calls: [], resultTruncated: false };
   }
   const envelope = extractFabricContent(result);
   const fallback = readResultArrays(result);
   const agents = mergeByName(envelope.agents, fallback.agents);
   const actors = mergeByName(envelope.actors, fallback.actors);
+  const calls = envelope.calls;
   if (envelope.resultPreview !== undefined) {
     return {
       agents,
       actors,
       operations: envelope.operations,
+      calls,
       ...(envelope.kernel ? { kernel: envelope.kernel } : {}),
       resultPreview: envelope.resultPreview,
       resultTruncated: envelope.resultTruncated,
@@ -337,6 +637,7 @@ export function summarizeFabricResult(result: unknown): {
     agents,
     actors,
     operations: envelope.operations,
+    calls,
     ...(envelope.kernel ? { kernel: envelope.kernel } : {}),
     resultPreview: preview,
     resultTruncated: truncated,
