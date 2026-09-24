@@ -1071,7 +1071,7 @@ describe("audit fixes", () => {
   });
 
   it("finds children past a long tail of non-agent audits", () => {
-    const audits = Array.from({ length: 25 }, (_, index) => ({
+    const audits: unknown[] = Array.from({ length: 25 }, (_, index) => ({
       ref: "pi.read",
       provider: "pi",
       success: true,
