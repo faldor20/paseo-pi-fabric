@@ -3,11 +3,11 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   FABRIC_TOOL_NAME,
   summarizeFabricResult,
-  type AgentTimelineItem,
   type fabricActorLogRpc,
   type fabricActorTellRpc,
   type fabricActorsListRpc,
 } from "../shared/fabric";
+import type { AgentTimelineItem } from "./types";
 import { listMeshActors, readMeshActorLog } from "./mesh";
 import { readFullTimeline } from "./timeline";
 

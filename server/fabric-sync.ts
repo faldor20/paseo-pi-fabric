@@ -6,10 +6,10 @@ import {
   summarizeFabricCode,
   summarizeFabricResult,
   titleHintForCode,
-  type AgentTimelineItem,
   type FabricAgentStatus,
   type FabricExecData,
 } from "../shared/fabric";
+import type { AgentTimelineItem } from "./types";
 
 // Mirrors fabric-spawned children as managed Paseo subagents so they appear in
 // the parent's subagents track, archive with the parent, and can be detached
