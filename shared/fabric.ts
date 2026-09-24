@@ -85,6 +85,20 @@ export const fabricAgentStatusSchema = z.enum([
 
 export type FabricAgentStatus = z.output<typeof fabricAgentStatusSchema>;
 
+// Delegated cost, straight from the audit child `result.usage`. Mirrors are
+// idle sessions (their own `lastUsage` stays empty), so audit reads the
+// child's cost here instead.
+// No passthrough: the row must stay assignable to JsonValue for timeline append.
+export const fabricAgentUsageSchema = z.object({
+  input: z.number().optional(),
+  output: z.number().optional(),
+  cacheRead: z.number().optional(),
+  cacheWrite: z.number().optional(),
+  cost: z.number().optional(),
+});
+
+export type FabricAgentUsage = z.output<typeof fabricAgentUsageSchema>;
+
 export const fabricAgentSchema = z.object({
   name: z.string().optional(),
   status: fabricAgentStatusSchema,
@@ -95,9 +109,11 @@ export const fabricAgentSchema = z.object({
   resultPreview: z.string().optional(),
   id: z.string().optional(),
   cwd: z.string().optional(),
-  // pi-fabric does not emit this yet (forward-compat): a stable per-child id
-  // for live-loop dedupe. Stripped from stored card rows; carried on the
-  // mirror candidate instead.
+  turns: z.number().int().nonnegative().optional(),
+  toolCalls: z.number().int().nonnegative().optional(),
+  usage: fabricAgentUsageSchema.optional(),
+  // Stable per-child audit id, emitted by pi-fabric >= 0.94.0. Stripped from
+  // stored card rows; carried on the mirror candidate and mirror labels.
   nestedToolCallId: z.string().optional(),
 });
 
@@ -265,7 +281,10 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
+// Per-kind cap, applied AFTER filtering for agent/actor audits: a program
+// with dozens of pi.* calls must not push trailing children off the list.
 const MAX_ENVELOPE_ENTRIES = 20;
+const nonnegativeInt = z.number().int().nonnegative();
 const MAX_AGENT_TEXT_PREVIEW_CHARS = 2000;
 
 function countRefs(refs: string[]): FabricNestedCall[] {
@@ -277,10 +296,10 @@ function countRefs(refs: string[]): FabricNestedCall[] {
     .slice(0, 24);
 }
 
-// Stable per-child key for mirror dedupe. pi-fabric plans to emit
-// `nestedToolCallId` on audits but does not yet, so the call-id + child-index
-// fallback must keep working; indices are stable because agent audits only
-// append within one fabric_exec call.
+// Stable per-child key for mirror dedupe. pi-fabric >= 0.94.0 emits
+// `nestedToolCallId` on audits; the call-id + child-index fallback stays for
+// older envelopes and pre-upgrade mirrors. Indices are stable because agent
+// audits only append within one fabric_exec call.
 export function fabricChildKey(
   callId: string,
   childIndex: number,
@@ -311,6 +330,36 @@ function auditAgentStatus(
 // args live in `audits[].args` — `trace.operations[].args` is empty (`{}`).
 // In-flight children (live `fabric_exec` rows) appear here as audits with
 // args/startedAt but no `success`/`result` yet; they read as running.
+// Grandchild envelopes: a nested fabric_exec surfaces under the child's
+// `result.preview.tools[].result.details`, with the same envelope shape.
+function nestedAuditDetails(result: Record<string, unknown> | null): unknown[] {
+  const preview = result !== null ? asRecord(result.preview) : null;
+  const tools = preview !== null && Array.isArray(preview.tools) ? preview.tools : [];
+  const nested: unknown[] = [];
+  for (const tool of tools) {
+    const details = asRecord(asRecord(tool)?.result)?.details;
+    if (details !== undefined) nested.push(details);
+  }
+  return nested;
+}
+
+// One flat audit list: direct audits first, then grandchildren depth-first.
+function flattenAudits(details: unknown, depth = 0): unknown[] {
+  if (depth > 4) return [];
+  const record = asRecord(details);
+  if (record === null || !Array.isArray(record.audits)) return [];
+  const flat: unknown[] = [];
+  for (const raw of record.audits) {
+    flat.push(raw);
+    const audit = asRecord(raw);
+    const result = audit !== null ? asRecord(audit.result) : null;
+    for (const nested of nestedAuditDetails(result)) {
+      flat.push(...flattenAudits(nested, depth + 1));
+    }
+  }
+  return flat;
+}
+
 function readEnvelopeAudits(details: unknown): {
   agents: FabricAgent[];
   actors: FabricActor[];
@@ -319,9 +368,7 @@ function readEnvelopeAudits(details: unknown): {
   const agents: FabricAgent[] = [];
   const actors: FabricActor[] = [];
   let textPreview: { preview: string; truncated: boolean } | undefined;
-  const record = asRecord(details);
-  const rawAudits = record !== null && Array.isArray(record.audits) ? record.audits : [];
-  for (const raw of rawAudits.slice(0, MAX_ENVELOPE_ENTRIES)) {
+  for (const raw of flattenAudits(details)) {
     const audit = fabricAuditSchema.safeParse(raw);
     if (!audit.success) continue;
     const result = asRecord(audit.data.result);
@@ -330,6 +377,7 @@ function readEnvelopeAudits(details: unknown): {
     // FabricActorMessage, tell -> { queued: true }) but message an existing
     // actor by id; mirroring them shells a new orphan subagent per message.
     if (audit.data.provider === "agents" && (audit.data.ref === "agents.run" || audit.data.ref === "agents.spawn")) {
+      if (agents.length >= MAX_ENVELOPE_ENTRIES) continue;
       const status = auditAgentStatus(audit.data.success, result);
       if (status === null) continue;
       const args = asRecord(audit.data.args);
@@ -338,6 +386,9 @@ function readEnvelopeAudits(details: unknown): {
           ? truncate(result.text, MAX_AGENT_TEXT_PREVIEW_CHARS)
           : undefined;
       if (textPreview === undefined && text !== undefined) textPreview = text;
+      const turns = result !== null ? nonnegativeInt.safeParse(result.turns) : null;
+      const toolCalls = result !== null ? nonnegativeInt.safeParse(result.toolCalls) : null;
+      const usage = result !== null ? fabricAgentUsageSchema.safeParse(result.usage) : null;
       agents.push({
         ...(result !== null && typeof result.name === "string"
           ? { name: result.name }
@@ -353,11 +404,15 @@ function readEnvelopeAudits(details: unknown): {
         ...(text !== undefined ? { resultPreview: text.preview } : {}),
         ...(result !== null && typeof result.id === "string" ? { id: result.id } : {}),
         ...(result !== null && typeof result.cwd === "string" ? { cwd: result.cwd } : {}),
+        ...(turns !== null && turns.success ? { turns: turns.data } : {}),
+        ...(toolCalls !== null && toolCalls.success ? { toolCalls: toolCalls.data } : {}),
+        ...(usage !== null && usage.success ? { usage: usage.data } : {}),
         ...(typeof audit.data.nestedToolCallId === "string" && audit.data.nestedToolCallId
           ? { nestedToolCallId: audit.data.nestedToolCallId }
           : {}),
       });
     } else if (audit.data.ref === "agents.create" && result !== null && typeof result.name === "string") {
+      if (actors.length >= MAX_ENVELOPE_ENTRIES) continue;
       actors.push({
         name: result.name,
         status: typeof result.status === "string" ? result.status : "unknown",

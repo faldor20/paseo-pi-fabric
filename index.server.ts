@@ -1,7 +1,7 @@
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { fabricActorLogRpc, fabricActorTellRpc, fabricActorsListRpc } from "./shared/fabric";
 import { listFabricActors, readFabricActorLog, tellFabricActor } from "./server/actor-rpc";
-import { mirrorFabricChildren } from "./server/fabric-sync";
+import { archiveFabricMirrors, mirrorFabricChildren } from "./server/fabric-sync";
 import { startFabricLiveSync, stopAllFabricLiveSync, stopFabricLiveSync } from "./server/live-sync";
 
 export default function contribute(server: PluginServerContext) {
@@ -48,6 +48,24 @@ export default function contribute(server: PluginServerContext) {
     } catch (error) {
       console.error(
         "[pi-fabric] mirror sync failed:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  });
+
+  // Archiving the parent archives its mirrors: dead shells leave the
+  // subagents list together instead of polluting later audits.
+  server.on("agent.archived", async (event, context) => {
+    if (event.agent.provider !== "pi") return;
+    if (event.agent.parentAgentId !== null) return;
+    try {
+      const archived = await archiveFabricMirrors(context.paseo, event.agent.id);
+      if (archived > 0) {
+        console.log(`[pi-fabric] archived ${archived} mirrors of ${event.agent.id}`);
+      }
+    } catch (error) {
+      console.error(
+        "[pi-fabric] mirror archive failed:",
         error instanceof Error ? error.message : error,
       );
     }

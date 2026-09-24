@@ -89,10 +89,11 @@ shells them as cardless mirrors on the 2s `turn_started` poll loop; the final
 card lands once at `turn_ended`. In-flight audits report no child `model`, so
 live mirrors resolve `pi/<parent provider/model>` as fallback.
 
-`nestedToolCallId` is planned by pi-fabric as the stable per-child audit id
-but is **absent as of 0.92.10**. `fabricChildKey` prefers it when present and
-falls back to `callId#index`; mirror labels always key on call-id +
-child-index.
+`nestedToolCallId` is the stable per-child audit id, emitted since pi-fabric
+0.94.0 (absent in 0.92.10). `fabricChildKey` prefers it with a
+`callId#index` fallback for older envelopes and pre-upgrade mirrors; mirror
+labels carry it as `pi-fabric.nested-id`, and dedupe matches on it before
+falling back to the index.
 
 ## Paseo-side gotchas (verified live)
 
@@ -112,6 +113,20 @@ child-index.
   hence the poll loop. Loop lifetime is managed by `turn_ended` /
   next-`turn_started` / double-fault stop — not by the hook `AbortSignal`,
   whose scope around a fire-and-forget loop is not relied upon.
+
+## Audit contract
+
+Paseo audit discovers fabric children through mirror **labels**, the canonical
+join key: `pi-fabric.mirror=true` + `pi-fabric.call-id` +
+`pi-fabric.nested-id` (stable since pi-fabric 0.94.0; `pi-fabric.child-index`
+is the pre-upgrade fallback) + `pi-fabric.parent`. A native `sub_agent`
+row on the parent timeline is not possible: plugin timeline appends accept
+plugin-kind rows only, so the link cannot live in a tool-call detail —
+labels are the contract. Delegated cost rides on the mirror card row
+(`turns`/`toolCalls`/`usage`); the mirror session itself is idle, so its
+own `lastUsage` stays empty by design. Archiving the parent archives its
+mirrors (`agent.archived` hook). Spawn-and-forget children never settle, so
+they get a shell without a card rather than nothing.
 
 ## Still to capture live
 

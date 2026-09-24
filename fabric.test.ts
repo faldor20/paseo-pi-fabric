@@ -3,6 +3,7 @@ import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import { transformFabricExec } from "./client/transform-fabric";
 import {
   appendMirrorCardOnce,
+  archiveFabricMirrors,
   collectFabricMirrorCandidates,
   ensureFabricMirror,
   mirrorFabricChildren,
@@ -167,6 +168,7 @@ function stubPaseo(
     config?: { provider?: string };
   }> = [];
   const appended: unknown[] = [];
+  const archived: string[] = [];
   const timelines = new Map<string, unknown[]>(Object.entries(mirrorItems));
   const seed = existing.map((record, index) => {
     const id = record.id ?? `existing-${index}`;
@@ -201,6 +203,10 @@ function stubPaseo(
             : {
                 agent: { provider: parentSnapshot.provider, model: parentSnapshot.model },
               },
+        archive: async () => {
+          archived.push(id);
+          return { archivedAt: "2026-09-24T00:00:00.000Z" };
+        },
         timeline: {
           refetch: async () => ({
             entries: (timelines.get(id) ?? []).map((item) => ({ item })),
@@ -242,7 +248,7 @@ function stubPaseo(
       },
     },
   } as unknown as PluginHandlerContext["paseo"];
-  return { paseo, created, appended, timelines };
+  return { paseo, created, appended, archived, timelines };
 }
 
 const TWO_CHILD_CALL = fabricToolCall({ code: PROGRAM }, {
@@ -1032,5 +1038,220 @@ describe("Pi-compact card data", () => {
     ]);
     expect(candidate?.data.titleHint).toBe("Read + Run");
     expect(candidate?.data.calls.map((call) => call.tool)).toEqual(["run"]);
+  });
+});
+
+describe("audit fixes", () => {
+  const auditCall = (
+    audits: unknown[],
+    input: unknown = { code: PROGRAM },
+  ) => fabricToolCall(input, { details: { audits } });
+
+  it("carries each child's own result text, not the first child's", () => {
+    const [first, second] = collectFabricMirrorCandidates([
+      auditCall([
+        {
+          ref: "agents.run",
+          provider: "agents",
+          success: true,
+          args: { task: "First task." },
+          result: { name: "first", status: "completed", text: "first-result" },
+        },
+        {
+          ref: "agents.run",
+          provider: "agents",
+          success: true,
+          args: { task: "Second task." },
+          result: { name: "second", status: "completed", text: "second-result" },
+        },
+      ]),
+    ]);
+    expect(first?.data.resultPreview).toContain("first-result");
+    expect(second?.data.resultPreview).toContain("second-result");
+  });
+
+  it("finds children past a long tail of non-agent audits", () => {
+    const audits = Array.from({ length: 25 }, (_, index) => ({
+      ref: "pi.read",
+      provider: "pi",
+      success: true,
+      args: { path: `file-${index}.ts` },
+      result: "contents",
+    }));
+    audits.push({
+      ref: "agents.run",
+      provider: "agents",
+      success: true,
+      args: { task: "Late task." },
+      result: { name: "late", status: "completed", text: "late-result" },
+    });
+    const summary = summarizeFabricResult({ details: { audits } });
+    expect(summary.agents.map((agent) => agent.name)).toEqual(["late"]);
+  });
+
+  it("parses turns, toolCalls, and usage onto the child row", () => {
+    const [candidate] = collectFabricMirrorCandidates([
+      auditCall([
+        {
+          ref: "agents.run",
+          provider: "agents",
+          success: true,
+          args: { task: "Work." },
+          result: {
+            name: "worker",
+            status: "completed",
+            turns: 3,
+            toolCalls: 5,
+            usage: { input: 10, output: 20, cost: 0.01 },
+            text: "done",
+          },
+        },
+      ]),
+    ]);
+    expect(candidate?.data.agents[0]).toMatchObject({
+      turns: 3,
+      toolCalls: 5,
+      usage: { input: 10, output: 20, cost: 0.01 },
+    });
+  });
+
+  it("collects grandchildren from nested envelopes", () => {
+    const summary = summarizeFabricResult({
+      details: {
+        audits: [
+          {
+            ref: "agents.run",
+            provider: "agents",
+            success: true,
+            args: { task: "Parent task." },
+            result: {
+              name: "child",
+              status: "completed",
+              text: "child-done",
+              preview: {
+                tools: [
+                  {
+                    result: {
+                      details: {
+                        audits: [
+                          {
+                            ref: "agents.run",
+                            provider: "agents",
+                            success: true,
+                            args: { task: "Nested task." },
+                            result: { name: "grandchild", status: "completed", text: "nested-done" },
+                          },
+                        ],
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        ],
+      },
+    });
+    expect(summary.agents.map((agent) => agent.name)).toEqual(["child", "grandchild"]);
+  });
+
+  it("never double-prefixes a pi-namespaced audit model", () => {
+    const [candidate] = collectFabricMirrorCandidates([
+      auditCall([
+        {
+          ref: "agents.run",
+          provider: "agents",
+          success: true,
+          args: {},
+          result: { name: "worker", status: "completed", model: "pi/custom" },
+        },
+      ]),
+    ]);
+    expect(candidate?.provider).toBe("pi/custom");
+  });
+
+  it("writes the nested id label and matches on it over a stale index", async () => {
+    const call = auditCall([
+      {
+        ref: "agents.run",
+        provider: "agents",
+        nestedToolCallId: "nested-1",
+        success: true,
+        args: { task: "Stable task." },
+        result: { name: "stable", status: "completed", text: "stable-done" },
+      },
+    ]);
+    const first = stubPaseo();
+    await mirrorFabricChildren({
+      paseo: first.paseo,
+      parentAgentId: "parent-1",
+      cwd: "/tmp/work",
+      timeline: [call],
+    });
+    expect(first.created).toHaveLength(1);
+    expect(first.created[0]?.labels["pi-fabric.nested-id"]).toBe("nested-1");
+
+    // The stored row claims a stale index; the stable id still joins it.
+    const second = stubPaseo(
+      [
+        {
+          id: "mirror-0",
+          parentAgentId: "parent-1",
+          labels: {
+            "pi-fabric.mirror": "true",
+            "pi-fabric.call-id": "fabric-1",
+            "pi-fabric.child-index": "5",
+            "pi-fabric.parent": "parent-1",
+            "pi-fabric.nested-id": "nested-1",
+          },
+        },
+      ],
+      undefined,
+      { "mirror-0": [{ type: "plugin", id: "fabric-mirror-fabric-1-0" }] },
+    );
+    const result = await mirrorFabricChildren({
+      paseo: second.paseo,
+      parentAgentId: "parent-1",
+      cwd: "/tmp/work",
+      timeline: [call],
+    });
+    expect(second.created).toHaveLength(0);
+    expect(result.mirrored).toBe(0);
+  });
+
+  it("shells unsettled children without a card at turn_ended", async () => {
+    const { paseo, created, appended } = stubPaseo();
+    const result = await mirrorFabricChildren({
+      paseo,
+      parentAgentId: "parent-1",
+      cwd: "/tmp/work",
+      timeline: [
+        fabricToolCall(
+          { code: PROGRAM },
+          { agents: [{ name: "slow", status: "running", model: "m" }] },
+        ),
+      ],
+    });
+    expect(created).toHaveLength(1);
+    expect(appended).toHaveLength(0);
+    expect(result.mirrored).toBe(0);
+  });
+
+  it("archives mirrors of an archived parent", async () => {
+    const { paseo, archived } = stubPaseo(
+      [
+        {
+          parentAgentId: "parent-1",
+          labels: { "pi-fabric.mirror": "true", "pi-fabric.parent": "parent-1" },
+        },
+        {
+          parentAgentId: "parent-other",
+          labels: { "pi-fabric.mirror": "true", "pi-fabric.parent": "parent-other" },
+        },
+      ],
+      undefined,
+    );
+    expect(await archiveFabricMirrors(paseo, "parent-1")).toBe(1);
+    expect(archived).toEqual(["existing-0"]);
   });
 });

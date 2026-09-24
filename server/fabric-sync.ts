@@ -38,9 +38,8 @@ export interface FabricMirrorCandidate {
    */
   provider: string | null;
   /**
-   * Stable audit id when pi-fabric emits `nestedToolCallId` (forward-compat;
-   * absent today). Preferred for live-loop dedupe; labels still key on
-   * call-id + child-index.
+   * Stable audit id, emitted by pi-fabric >= 0.94.0. Preferred for dedupe;
+   * also written to the `pi-fabric.nested-id` mirror label.
    */
   nestedToolCallId?: string;
 }
@@ -58,11 +57,12 @@ const TERMINAL_CHILD_STATUS: ReadonlySet<FabricAgentStatus> = new Set([
 function mirrorStatusToCard(status: FabricAgentStatus): FabricExecData["status"] {
   if (status === "failed" || status === "timed_out") return "failed";
   if (status === "stopped") return "canceled";
+  if (status === "running") return "running";
   return "completed";
 }
 
-function mirrorKey(callId: string, childIndex: number): string {
-  return fabricChildKey(callId, childIndex);
+function mirrorKey(callId: string, childIndex: number, nestedToolCallId?: string): string {
+  return fabricChildKey(callId, childIndex, nestedToolCallId);
 }
 
 function mirrorCardId(callId: string, childIndex: number): string {
@@ -101,7 +101,13 @@ export function collectFabricMirrorCandidates(
         childIndex,
         name: agent.name ?? `fabric-agent-${childIndex + 1}`,
         ...(agent.cwd ? { cwd: agent.cwd } : {}),
-        provider: agent.model ? `pi/${agent.model}` : null,
+        // Audit models are bare (`org/model`); never double-prefix one that
+        // already carries the pi/ namespace.
+        provider: agent.model
+          ? agent.model.startsWith("pi/")
+            ? agent.model
+            : `pi/${agent.model}`
+          : null,
         ...(typeof nestedToolCallId === "string" && nestedToolCallId
           ? { nestedToolCallId }
           : {}),
@@ -112,8 +118,18 @@ export function collectFabricMirrorCandidates(
           nestedCalls,
           agents: [cardAgent],
           actors: [],
-          ...(summary.resultPreview ? { resultPreview: summary.resultPreview } : {}),
-          resultTruncated: summary.resultTruncated,
+          // Each mirror shows its OWN outcome: the shared summary preview is
+          // the first child's text, wrong for every other child.
+          // ponytail: per-agent truncation flag is lost in the envelope parse;
+          // the global flag applies to the fallback only.
+          ...(agent.resultPreview !== undefined
+            ? { resultPreview: agent.resultPreview, resultTruncated: false }
+            : summary.resultPreview !== undefined
+              ? {
+                  resultPreview: summary.resultPreview,
+                  resultTruncated: summary.resultTruncated,
+                }
+              : { resultTruncated: summary.resultTruncated }),
           status: mirrorStatusToCard(agent.status),
           originalStatus: agent.status,
           ...(titleHint ? { titleHint } : {}),
@@ -152,7 +168,12 @@ async function ensureMirrorWithProvider(
 ): Promise<{ mirrorAgentId: string; created: boolean } | null> {
   let existingId: string | null;
   try {
-    existingId = await findMirrorId(paseo, candidate.callId, candidate.childIndex);
+    existingId = await findMirrorId(
+      paseo,
+      candidate.callId,
+      candidate.childIndex,
+      candidate.nestedToolCallId,
+    );
   } catch (error) {
     console.error("[pi-fabric] mirror lookup failed; deferring:", error);
     return null;
@@ -176,6 +197,9 @@ async function ensureMirrorWithProvider(
         "pi-fabric.call-id": candidate.callId,
         "pi-fabric.child-index": String(candidate.childIndex),
         "pi-fabric.parent": parentAgentId,
+        // Canonical audit join key (see docs/fabric-wire.md): timeline rows
+        // can't carry it (plugin appends are plugin-kind only), so labels do.
+        ...(candidate.nestedToolCallId ? { "pi-fabric.nested-id": candidate.nestedToolCallId } : {}),
       },
     });
     return { mirrorAgentId: handle.id, created: true };
@@ -234,8 +258,17 @@ export async function mirrorFabricChildren(input: {
   cwd: string;
   timeline: readonly AgentTimelineItem[];
 }): Promise<{ mirrored: number; note?: string }> {
-  const candidates = collectFabricMirrorCandidates(input.timeline);
-  if (candidates.length === 0) return { mirrored: 0 };
+  const terminal = collectFabricMirrorCandidates(input.timeline);
+  // Spawn-and-forget children never settle: no audit result, no card — but the
+  // shell must still exist so audit sees the subagent instead of nothing.
+  const running = collectFabricMirrorCandidates(input.timeline, { includeRunning: true }).filter(
+    (candidate) => !TERMINAL_CHILD_STATUS.has(candidate.data.originalStatus),
+  );
+  const jobs = [
+    ...terminal.map((candidate) => ({ candidate, card: true as const })),
+    ...running.map((candidate) => ({ candidate, card: false as const })),
+  ];
+  if (jobs.length === 0) return { mirrored: 0 };
   const mirrorIndex = await readMirrorIndex(input.paseo);
   // Fail closed: an unreadable agent list must defer mirroring, not duplicate it.
   if (mirrorIndex === null) {
@@ -248,10 +281,12 @@ export async function mirrorFabricChildren(input: {
   let created = 0;
   let overflow = 0;
   let skipped = 0;
-  for (const candidate of candidates) {
+  for (const { candidate, card } of jobs) {
     // The cap bounds session creation only: already-mirrored children
     // (including cardless live shells) always get their card reconcile.
-    let mirrorAgentId = mirrorIndex.get(mirrorKey(candidate.callId, candidate.childIndex));
+    let mirrorAgentId = mirrorIndex.get(
+      mirrorKey(candidate.callId, candidate.childIndex, candidate.nestedToolCallId),
+    );
     if (mirrorAgentId === undefined) {
       if (created >= MAX_MIRRORS_PER_SYNC) {
         overflow += 1;
@@ -273,16 +308,20 @@ export async function mirrorFabricChildren(input: {
       if (ensured === null) continue;
       created += 1;
       mirrorAgentId = ensured.mirrorAgentId;
-      mirrorIndex.set(mirrorKey(candidate.callId, candidate.childIndex), mirrorAgentId);
+      mirrorIndex.set(
+        mirrorKey(candidate.callId, candidate.childIndex, candidate.nestedToolCallId),
+        mirrorAgentId,
+      );
     }
     if (
-      await appendMirrorCardOnce(
+      card &&
+      (await appendMirrorCardOnce(
         input.paseo,
         mirrorAgentId,
         candidate.callId,
         candidate.childIndex,
         candidate.data,
-      )
+      ))
     ) {
       mirrored += 1;
     }
@@ -300,6 +339,41 @@ export async function mirrorFabricChildren(input: {
     };
   }
   return { mirrored };
+}
+
+// Archiving the parent archives its mirrors, so dead shells stop polluting
+// the subagents list and later audits.
+export async function archiveFabricMirrors(
+  paseo: PluginHandlerContext["paseo"],
+  parentAgentId: string,
+): Promise<number> {
+  let archived = 0;
+  let cursor: string | undefined;
+  for (let page = 0; page < 5; page += 1) {
+    let payload: Awaited<ReturnType<typeof paseo.agents.list>>;
+    try {
+      payload = await paseo.agents.list({
+        filter: { labels: { "pi-fabric.mirror": "true", "pi-fabric.parent": parentAgentId } },
+        page: cursor === undefined ? { limit: 100 } : { limit: 100, cursor },
+      });
+    } catch (error) {
+      console.error("[pi-fabric] mirror archive list failed:", error);
+      return archived;
+    }
+    for (const entry of payload.entries) {
+      const id = readAgentId(entry);
+      if (id === null) continue;
+      try {
+        await paseo.agents.ref(id).archive();
+        archived += 1;
+      } catch (error) {
+        console.error(`[pi-fabric] mirror archive failed for ${id}:`, error);
+      }
+    }
+    if (!payload.pageInfo.hasMore || payload.pageInfo.nextCursor === null) break;
+    cursor = payload.pageInfo.nextCursor;
+  }
+  return archived;
 }
 
 /** Parent `provider/model` for mirrors whose audit reported no child model. */
@@ -333,22 +407,34 @@ async function findMirrorId(
   paseo: PluginHandlerContext["paseo"],
   callId: string,
   childIndex: number,
+  nestedToolCallId?: string,
 ): Promise<string | null> {
   let cursor: string | undefined;
+  let indexFallback: string | null = null;
   for (let page = 0; page < 5; page += 1) {
     const payload = await paseo.agents.list({
       filter: { labels: { "pi-fabric.mirror": "true", "pi-fabric.call-id": callId } },
       page: cursor === undefined ? { limit: 100 } : { limit: 100, cursor },
     });
     for (const entry of payload.entries) {
+      // The stable id wins: a reorder/append must not reattribute a child to
+      // a stale index row. Pre-upgrade mirrors carry no nested-id label, so
+      // the index match stays as fallback.
+      if (
+        nestedToolCallId !== undefined &&
+        readLabel(entry, "pi-fabric.nested-id") === nestedToolCallId
+      ) {
+        const id = readAgentId(entry);
+        if (id !== null) return id;
+      }
       if ((readLabel(entry, "pi-fabric.child-index") ?? "0") !== String(childIndex)) continue;
       const id = readAgentId(entry);
-      if (id !== null) return id;
+      if (id !== null && indexFallback === null) indexFallback = id;
     }
     if (!payload.pageInfo.hasMore || payload.pageInfo.nextCursor === null) break;
     cursor = payload.pageInfo.nextCursor;
   }
-  return null;
+  return indexFallback;
 }
 function readLabel(entry: unknown, key: string): string | null {
   if (typeof entry !== "object" || entry === null) return null;
@@ -388,7 +474,14 @@ async function readMirrorIndex(
       const callId = readLabel(entry, "pi-fabric.call-id");
       const id = readAgentId(entry);
       if (!callId || id === null) continue;
-      index.set(mirrorKey(callId, Number(readLabel(entry, "pi-fabric.child-index") ?? "0")), id);
+      index.set(
+        mirrorKey(
+          callId,
+          Number(readLabel(entry, "pi-fabric.child-index") ?? "0"),
+          readLabel(entry, "pi-fabric.nested-id") ?? undefined,
+        ),
+        id,
+      );
     }
     if (!payload.pageInfo.hasMore || payload.pageInfo.nextCursor === null) break;
     cursor = payload.pageInfo.nextCursor;

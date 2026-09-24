@@ -43,7 +43,9 @@ export function startFabricLiveSync(
     if (stopped || liveLoops.get(parent.id) !== loop) return;
     try {
       // One cheap tail-page read per poll; the active turn's fabric rows are
-      // at the tail. Non-Pi noise costs one RPC and collects nothing.
+      // at the tail. Histories longer than the tail page reconcile at
+      // turn_ended from the full event timeline, so no multi-page walk here.
+      // Non-Pi noise costs one RPC and collects nothing.
       const page = await paseo.agents
         .ref(parent.id)
         .timeline.refetch({ limit: LIVE_TIMELINE_LIMIT });

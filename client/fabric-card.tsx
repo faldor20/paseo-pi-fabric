@@ -155,6 +155,19 @@ export function FabricExecCard({ item, theme }: PluginTimelineItemProps<FabricEx
                       {agent.taskPreview}
                     </Text>
                   ) : null}
+                  {agent.turns !== undefined ||
+                  agent.toolCalls !== undefined ||
+                  agent.usage?.cost !== undefined ? (
+                    <Text style={styles.subText} numberOfLines={1}>
+                      {[
+                        agent.turns !== undefined ? `${agent.turns} turns` : null,
+                        agent.toolCalls !== undefined ? `${agent.toolCalls} calls` : null,
+                        agent.usage?.cost !== undefined ? `cost ${agent.usage.cost}` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </Text>
+                  ) : null}
                   {agent.resultPreview ? (
                     <Text style={styles.subText} numberOfLines={4}>
                       {agent.resultPreview}
