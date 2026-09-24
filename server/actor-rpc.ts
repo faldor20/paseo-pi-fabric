@@ -1,9 +1,9 @@
-import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { RpcInput } from "@getpaseo/plugin";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   FABRIC_TOOL_NAME,
   summarizeFabricResult,
+  type AgentTimelineItem,
   type fabricActorLogRpc,
   type fabricActorTellRpc,
   type fabricActorsListRpc,

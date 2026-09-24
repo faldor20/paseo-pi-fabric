@@ -1,5 +1,5 @@
-import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
+import type { AgentTimelineItem } from "../shared/fabric";
 
 const TIMELINE_PAGE_SIZE = 200;
 const TIMELINE_MAX_PAGES = 10;

@@ -1,10 +1,18 @@
 import { defineRpc } from "@getpaseo/plugin";
+import type { PluginLifecycleEvents } from "@getpaseo/plugin/server";
 import { z } from "zod";
+
+// Indexed from the plugin server entry: @getpaseo/protocol only exposes a
+// wildcard subpath export, which the plugin install-time resolver cannot
+// see, so nothing may import @getpaseo/protocol/* directly.
 
 // Tool name pi-fabric registers with Pi. Paseo's Pi provider surfaces it as
 // an `unknown` tool_call today; the client transformer in
 // `client/transform-fabric.ts` claims it.
 export const FABRIC_TOOL_NAME = "fabric_exec";
+
+export type AgentTimelineItem =
+  PluginLifecycleEvents["agent.turn_ended"]["timeline"][number];
 
 // Reads the fabric program source from a Paseo `unknown` tool-call input.
 // Shared by the client transformer and the server mirror sync so both sides

@@ -1,4 +1,3 @@
-import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { PluginHandlerContext } from "@getpaseo/plugin/server";
 import {
   FABRIC_TOOL_NAME,
@@ -7,6 +6,7 @@ import {
   summarizeFabricCode,
   summarizeFabricResult,
   titleHintForCode,
+  type AgentTimelineItem,
   type FabricAgentStatus,
   type FabricExecData,
 } from "../shared/fabric";
